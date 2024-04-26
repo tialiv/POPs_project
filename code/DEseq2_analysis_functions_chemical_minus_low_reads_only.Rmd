@@ -1,0 +1,1485 @@
+---
+title: "DE RNA-Seq analysis of POPs in 4 cell lines - stratified according to design group (chemical_group)"
+author: "Tianyi Li"
+date: "11/10-2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include = F}
+knitr::opts_chunk$set(echo = T)
+```
+
+# Cell line bulk RNAseq analysis 
+
+Rows in the raw count matrix is renamed using geneID. Chemicals and cell lines are separated for the downstream analysis.  
+
+## Install libraries
+
+```{r include=F}
+citation("msigdbr")
+```
+
+
+## Load required library
+
+```{r Load dependencies}
+suppressMessages(library(dplyr))
+suppressMessages(library(som))
+suppressMessages(library(readr))
+suppressMessages(library(DESeq2))
+suppressMessages(library(ggplot2))
+suppressMessages(library(pheatmap))
+suppressMessages(library(umap))
+suppressMessages(library(biomaRt))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(DOSE))
+suppressMessages(library(pathview))
+suppressMessages(library(clusterProfiler))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(msigdbr))
+suppressMessages(library(edgeR))
+suppressMessages(library(tidyverse))
+suppressMessages(library(enrichplot))
+suppressMessages(library(openxlsx))
+suppressMessages(library(ggrepel))
+suppressMessages(library(matrixStats))
+```
+
+## Raw data input
+
+```{r initial data input}
+cells <- read.delim(file = "/Users/tili/Desktop/PhD/POPs/data/subreadCounts.txt", header=T, sep=";")
+info <- read.csv(file = "/Users/tili/Desktop/PhD/POPs/data/info.csv", header = T, sep = ";")
+cells[is.na(cells)] <- 0 
+
+#lowreads ~100-400 only
+info <- info[-c(22:24,110,133),] #PCB_156_10X_COV_P27A, PCB_156_10X_COV_P28A, PCB_156_10X_COV_P33A,PFOS_1X_KGN_P10A removed because low reads (~100-400 only), HCB_100X_PA_P339A removed due to being clear outlier in PCA
+
+#based on plots, double checked samples with low reads; ~100 read only
+#colSums(counts(dataset[["dds_PCB_156_COV"]])) #PCB_156_10X_COV_P27A, PCB_156_10X_COV_P28A, PCB_156_10X_COV_P33A
+#colSums(counts(dataset[["dds_PFOS_KGN"]])) #PFOS_1X_KGN_P10A
+```
+
+## Rename rows for count matrix
+
+```{r rename row names for count matrix}
+re_name <- function(cells) {
+  gene <- cells[,1]
+  rownames(cells) <- gene
+  cells <- cells[,-1]
+  return(cells)
+}
+
+re_order <- function(info, cells) {
+  genomic_idx <- match(info$sample, colnames(cells))
+  genomic_idx
+  cells <- cells[ ,genomic_idx]
+  all(info$sample == colnames(cells))
+  return(cells)
+}
+
+cells <- re_order(info, cells)
+
+```
+
+## Stratified data by chemicals
+
+```{r stratified data by chemicals}
+chemical <- c("HCB", "DDE", "PCB_156", "PCB_180", "PFOS", "MIX")
+cell_line <- c("COV", "KGN", "PA", "Primary")
+
+
+for (i in chemical) {
+    info_chemical <- info %>% dplyr::filter(chemical == i | chemical == "DMSO") 
+    write.csv(info_chemical, file = paste("/Users/tianyi.li.2/Desktop/POPs_project/data/processed/info_",i,".csv", sep = ""))
+    cells_ordered <- re_order(info_chemical, cells)
+    write.csv(cells_ordered, file = paste("/Users/tianyi.li.2/Desktop/POPs_project/data/processed/cells_",i,".csv", sep = ""))
+  }
+
+```
+
+## Construct dds objects
+
+```{r construct dds object}
+dataset <- vector(mode = "list", length = 0)
+for (i in chemical) {
+    print(i)
+    files <- paste0("/Users/tianyili/Desktop/POPs_project/data/processed/info_",i,".csv")
+    info2 <- read.csv(file = files, sep = ",")
+    info2$group <- as.factor(info2$group)
+    info2$group <- relevel(info2$group,ref="KGN_DMSO_DMSO")
+    files_cells <- paste0("/Users/tianyili/Desktop/POPs_project/data/processed/cells_",i,".csv")
+    cells2 <- read.delim(file = files_cells, sep = ",")
+    cells2 <- re_name(cells2)
+    print(all(info2$sample == colnames(cells2)))
+    dataset[[paste0("dds_", i)]] <- DESeqDataSetFromMatrix(countData=cells2, colData = info2, design = ~ group)
+  }
+```
+
+## Filter low counts 
+
+```{r low count filtering}
+dataset <- lapply(dataset, function(x) {
+  keep <- rowSums(counts(x) > 1) >= 3
+  x <- x[keep,]
+})
+
+```
+
+## Perform DE analysis
+
+```{r get DESeq}
+for(i in 1:length(dataset)){
+  print(names(dataset)[i])
+  dataset[[i]] <- DESeq(dataset[[i]])
+}
+```
+
+## Plot library size / how many reads per sample
+
+```{r sequence depth check}
+theme <- theme(text=element_text(size=13),
+               axis.text.x=element_text(color="black", angle = 45, hjust= 1),
+               axis.text.y=element_text(color="black", hjust=0.5, vjust=0.5),
+               strip.background = element_rect(colour=NA, fill=NA),
+               plot.background = element_blank(),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               panel.border = element_blank(),
+               axis.line.x = element_line(linewidth=0.4),
+               axis.line.y = element_line(linewidth=0.4),
+               panel.background = element_blank(),
+               legend.position = "bottom")
+
+qc_plot <- list()
+for (i in chemical) {
+    files <- paste0("/Users/tianyili/Desktop/POPs_project/data/processed/info_",i,".csv")
+    info <- read.csv(file = files, sep = ",")
+    gg <- info %>%
+          mutate(read = colSums(counts(dataset[[paste0("dds_", i)]]))) %>% 
+            ggplot(aes(x=sample, y=read)) + geom_bar(stat = "identity") + geom_line() + theme +
+            ggtitle(paste0("Sequences Read per Sample for ",i)) + xlab("")
+    qc_plot[[length(qc_plot) + 1]] <- gg
+}
+patchwork::wrap_plots(qc_plot, ncol = 3)
+
+```
+
+## PCA plot using normalized data - vst method in DESeq2
+
+```{r PCA plot vst}
+PCA_vst <- list()
+for (i in chemical) {
+    r <- vst(dataset[[paste0("dds_", i)]], blind = T, fitType='mean')
+    pca <- plotPCA(r, intgroup=c("conc", "chemical", "group"), returnData = T) 
+    percentVar <- round(100 * attr(pca, "percentVar")) 
+    ggpca <- ggplot(pca, aes(PC1, PC2, shape = conc, color=group)) + 
+      ggtitle(paste0("PCA (vst) - ", i)) + theme +
+      geom_point(size = 3) + 
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) 
+    PCA_vst[[length(PCA_vst) + 1]] <- ggpca
+}
+patchwork::wrap_plots(PCA_vst, ncol = 3)
+```
+
+## UMAP visualization using normalization method
+
+```{r UMAP plot}
+umap_vst <- list()
+for (i in chemical) {
+    r <- vst(dataset[[paste0("dds_", i)]], blind = T, fitType='mean')
+    files <- paste0("/Users/tianyili/Desktop/POPs_project/data/processed/info_",i,".csv")
+    info <- read.csv(file = files, sep = ",")
+    set.seed(314)
+    normalized_counts <- assay(r) %>% t()
+    umap_results <- umap::umap(normalized_counts, n_neighbors = 3) 
+    umap_plot_df <- data.frame(umap_results$layout) %>%
+    tibble::rownames_to_column("sample") %>% 
+    dplyr::inner_join(info, by = "sample")
+    gg <- ggplot(umap_plot_df, aes(x = X1, y = X2, color = group, shape=conc)) + geom_point(size = 2.5) + 
+      ggtitle(paste0("UMAP (vst) - ", i)) + theme(text=element_text(size=13),
+               axis.text.x=element_text(color="black", hjust=1, vjust=0.5),
+               axis.text.y=element_text(color="black", hjust=0.5, vjust=0.5),
+               strip.background = element_rect(colour=NA, fill=NA),
+               plot.background = element_blank(),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               panel.border = element_blank(),
+               axis.line.x = element_line(size=0.4),
+               axis.line.y = element_line(size=0.4),
+               panel.background = element_blank(),
+               legend.position = "bottom") 
+    umap_vst[[length(umap_vst) + 1]] <- gg
+}
+patchwork::wrap_plots(umap_vst, ncol = 3)
+
+```
+
+## Heatmap: hierarchical clustering to view the similarities between biological replicates
+
+```{r Heatmap for hierarchical clustering}
+heatmap_vst <- list()
+for (i in chemical) {
+    r <- vst(dataset[[paste0("dds_", i)]], blind = T, fitType='mean')
+    r_cor <- cor(assay(r))
+    df <- as.data.frame(colData(dataset[[paste0("dds_", i)]])[,c("cell_line", "conc", "group")])
+    ggmap <- pheatmap(r_cor, scale = "column", show_rownames = T, annotation = df, fontsize = 8,
+         clustering_distance_cols = "manhattan", main = paste0("Heatmap (vst) - ", i))
+    heatmap_vst[[length(heatmap_vst) + 1]] <- ggmap
+}
+
+```
+
+## DE analysis 
+
+```{r DE analysis}
+
+comparisonALL <- list()
+for(i in chemical) {
+  for (j in cell_line) {
+    files <- paste0("/Users/tianyili/Desktop/POPs_project/data/processed/info_", i,".csv")
+    info <- read.csv(file = files, sep = ",")
+    info <- info %>% mutate(groups = paste0(chemical, "_", conc))
+    info$group <- as.factor(info$group)
+    info$groups <- as.factor(info$groups)
+    gro <- factor(levels(info$groups)[levels(info$groups) != "DMSO_DMSO"])
+      for(k in gro){
+        p <- paste0(j,"_",k)
+          if (p %in% levels(info$group)){
+            print(p)
+            comparisonALL[[p]] <- results(dataset[[paste0("dds_",i)]], 
+                                    contrast = c("group", p, paste0(j,"_DMSO_DMSO")), 
+                                    independentFiltering = T, pAdjustMethod = "fdr") %>% 
+                                  as.data.frame() %>% 
+                                  mutate(geneid = rownames(.))}
+    else { print(paste0(p," No result"))}       
+    }  
+  }
+}  
+  
+#significant DEG
+comparison05 <- list()
+for (i in 1:length(comparisonALL)) {
+  comparison05[[names(comparisonALL)[i]]] <- comparisonALL[[i]] %>% filter(padj<0.05)
+}
+
+comparison01 <- list()
+for (i in 1:length(comparisonALL)) {
+  comparison01[[names(comparisonALL)[i]]] <- comparisonALL[[i]] %>% filter(padj<0.1)
+}
+
+#get gene description
+mart <- useEnsembl(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+output <- getBM(attributes=c("ensembl_gene_id","external_gene_name","entrezgene_id","description"), mart = mart)
+
+get_id <- function(x) {
+  x$geneid <- rownames(x)
+  final <- merge(x, output, by.x = "geneid", by.y = "ensembl_gene_id", all.x = T, all.y = F)
+  return(final)
+}
+
+final <- lapply(comparison05, function(x) {
+  x <- get_id(x)
+})
+
+final01 <- lapply(comparison01, function(x) {
+  x <- get_id(x)
+})
+
+finalALL <- lapply(comparisonALL, function(x) {
+  x <- get_id(x)
+})
+
+save(dataset, comparisonALL, comparison05, final, finalALL, file = "/Users/tianyi.li.2/Desktop/POPs_project/results/DESeq2_low_read_removed_sig05.Rdata")
+
+openxlsx::write.xlsx(final, file = "/Users/tianyi.li.2/Desktop/POPs_project/results/tables/DESeq2_low_read_removed_sig05_20230213.xlsx")
+
+```
+
+## Overview of the DEGs
+
+```{r number of DEGs}
+
+df_DEGs <- data.frame()
+for (i in 1:length(final)) {
+  temp <- final[[i]]
+  temp1 <- as.data.frame(table(temp$log2FoldChange > 0)) %>% mutate(group = names(final[i]))
+  df_DEGs <- rbind(df_DEGs, temp1)
+}
+
+df_DEGs <- df_DEGs %>% mutate(regulate = ifelse(str_detect(.$Var1, "FALSE"), "Down", "Up")) 
+df_DEGs <- df_DEGs %>% mutate(count = ifelse(str_detect(df_DEGs$regulate, "Down"), paste0("-", df_DEGs$Freq), df_DEGs$Freq))
+df_DEGs$count <- as.numeric(df_DEGs$count)
+id <- c(id, id1, id2, id3, id4, id5)
+id <- id[-which(id %in% c("COV_DMSO_DMSO", "KGN_DMSO_DMSO", "PA_DMSO_DMSO", "Primary_DMSO_DMSO"))]
+df_DEGs$group <- factor(df_DEGs$group, levels = id)
+df_DEGs$cell_line <- ifelse(str_detect(df_DEGs$group, "COV"), "COV434",
+                            ifelse(str_detect(df_DEGs$group, "KGN"), "KGN",
+                                   ifelse(str_detect(df_DEGs$group, "PA"), "PA1", "Primary")))
+
+p1 <- df_DEGs %>% filter(cell_line == "COV434") %>%  
+  ggplot(aes(x=group, y=count, fill=regulate)) + geom_bar(stat = "identity") + 
+  theme + xlab("") + ylim(c(-250, 250)) + 
+  ggtitle("COV434") + scale_fill_manual(values = c("Down" = "#91bfdb", "Up" = "#fc8d59"))
+
+p2 <- df_DEGs %>% filter(cell_line == "KGN") %>%  
+  ggplot(aes(x=group, y=count, fill=regulate)) + geom_bar(stat = "identity") + 
+  theme + xlab("") + ylim(c(-250, 250)) + 
+  ggtitle("KGN") + scale_fill_manual(values = c("Down" = "#91bfdb", "Up" = "#fc8d59"))
+
+p3 <- df_DEGs %>% filter(cell_line == "PA1") %>%  
+  ggplot(aes(x=group, y=count, fill=regulate)) + geom_bar(stat = "identity") + 
+  theme + xlab("") + ylim(c(-250, 250)) + 
+  ggtitle("PA1") + scale_fill_manual(values = c("Down" = "#91bfdb", "Up" = "#fc8d59"))
+
+p4 <- df_DEGs %>% filter(cell_line == "Primary") %>%  
+  ggplot(aes(x=group, y=count, fill=regulate)) + geom_bar(stat = "identity") + 
+  theme + xlab("") + ylim(c(-250, 250)) + 
+  ggtitle("Primary") + scale_fill_manual(values = c("Down" = "#91bfdb", "Up" = "#fc8d59"))
+
+p1 + p2 + p3 + p4 + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect")
+
+```
+
+
+## DEGs expression across all the chemicals and dataset
+
+```{r DEGs heatmap}
+dds <- DESeqDataSetFromMatrix(countData=cells, colData = info, design = ~ group)
+
+keep <- rowSums(counts(dds) > 1) >= 3
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+
+# PCA for all the samples and cell lines
+r <- vst(dds, blind = T, fitType='mean')
+pca <- plotPCA(r, intgroup=c("conc", "chemical", "group", "cell_line"), returnData = T) 
+percentVar <- round(100 * attr(pca, "percentVar")) 
+ggplot(pca, aes(PC1, PC2, color=cell_line)) + 
+      ggtitle(paste0("PCA (vst)")) + theme +
+      geom_point(size = 3) + 
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  stat_ellipse()
+
+# UMAP for all cell lines
+r <- vst(dds, blind = T)
+normalized_counts <- assay(r) %>% t()
+umap_results <- umap::umap(normalized_counts, n_neighbors = 3) 
+umap_plot_df <- data.frame(umap_results$layout) %>%
+    tibble::rownames_to_column("sample") %>% 
+    dplyr::inner_join(info, by = "sample")
+ggplot(umap_plot_df, aes(x = X1, y = X2, color = cell_line)) + geom_point(size = 2.5) + 
+      ggtitle(paste0("UMAP (vst)")) + theme(text=element_text(size=13),
+               axis.text.x=element_text(color="black", hjust=1, vjust=0.5),
+               axis.text.y=element_text(color="black", hjust=0.5, vjust=0.5),
+               strip.background = element_rect(colour=NA, fill=NA),
+               plot.background = element_blank(),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               panel.border = element_blank(),
+               axis.line.x = element_line(size=0.4),
+               axis.line.y = element_line(size=0.4),
+               panel.background = element_blank(),
+               legend.position = "bottom")
+  
+```
+
+## Volcano plot
+
+```{r}
+pval_threshold <- 0.05
+logfc_threshold <- 1
+
+volcano_vst <- list()
+for (i in 1:length(comparisonALL)) {
+      deseq.results <- comparisonALL[[i]]
+      deseq.results <- deseq.results %>% filter(!is.na(padj))
+      deseq.results$threshold <- as.factor(abs(deseq.results$log2FoldChange) >= logfc_threshold & 
+                             deseq.results$padj < pval_threshold)
+      deseq.results <- merge(deseq.results, output[,1:2], by.x = "geneid", by.y = "ensembl_gene_id", all.x = T, all.y = F)
+      volcano_vst[[names(comparisonALL)[i]]] <- ggplot(data=deseq.results, 
+            aes(x=log2FoldChange, y=-log10(padj), colour=threshold)) +
+            geom_point(alpha=0.4, size=1.75) +
+            theme(legend.position = "none") +
+            theme_bw() + theme(legend.position="none") +
+            geom_vline(xintercept = logfc_threshold) +
+            geom_vline(xintercept = -logfc_threshold) +
+            geom_hline(yintercept = -log10(pval_threshold)) +
+            xlab("log2 fold change") + ylab("-log10 FDR") +
+            ggtitle(paste0(names(comparisonALL)[i], " DEGs according to DESeq2\nwith FDR <= 0.05 and absolute FC >= 1")) +
+            geom_text_repel(aes(label=ifelse(padj < pval_threshold & abs(log2FoldChange) >= logfc_threshold,
+                                   external_gene_name, ''), max.overlaps=30))
+  }
+patchwork::wrap_plots(volcano_vst, ncol = 3)
+
+```
+
+## Shrunk DE for downstream functional analysis
+
+```{r get shrunk data for functional analysis}
+res_shrunk <- list()
+
+for (i in chemical) {
+  for (j in cell_line) {
+      dataset[[paste0("dds_", i)]]$group <- relevel(dataset[[paste0("dds_", i)]]$group, ref = paste0(j,"_DMSO_DMSO"))
+      dataset[[paste0("dds_", i)]] <- nbinomWaldTest(dataset[[paste0("dds_", i)]], maxit=1000)
+      groups <- levels(dataset[[paste0("dds_", i)]]$group)
+      groups <- groups[groups %in% grep(j, groups, value=T)]
+      groups <- groups[!groups %in% grep("DMSO", groups, value=T)]
+      for (k in groups){ 
+         print(k)
+         res_shrunk[[k]] <- lfcShrink(dataset[[paste0("dds_", i)]], coef =  match(paste0("group_",k,"_vs_",j,"_DMSO_DMSO"),   
+                                                                                  resultsNames(dataset[[paste0("dds_", i)]])), 
+                                      type = "apeglm") %>% as.data.frame() %>% mutate(geneid = rownames(.))
+    }
+  }
+} 
+
+shrunk_sig <- list()
+for (i in 1:length(res_shrunk)) {
+    shrunk_sig[[names(res_shrunk)[i]]] <- res_shrunk[[i]] %>% filter(padj<0.05)
+    }
+
+
+```
+
+# Get background gene sets
+
+```{r get background genes for functional analysis}
+
+res_shrunk <- lapply(res_shrunk, function(x) {
+  x <- get_id(x)
+})
+
+shrunk_sig <- lapply(shrunk_sig, function(x) {
+  x <- get_id(x)
+})
+
+```
+
+# Get logpadj and entrezgene id for functional analysis
+-log10(padj) then get the sign of the log2FC. If upregulated, positive. If downregulated, negative. Then rank according to the logpadj. The nonsignificant ones will end up in the middle (which is not important in the enrichement)
+Almost similar to ranking with log2FC
+
+```{r get background genes for functional analysis}
+
+GeneList <- list()
+for(i in 1:length(res_shrunk)){
+  genelist <- res_shrunk[[i]] %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    mutate(logpadj = ifelse(log2FoldChange<0, log10(padj), -log10(padj))) %>% 
+    filter(!is.na(entrezgene_id))
+  GeneList[[names(res_shrunk)[i]]] <- genelist$log2FoldChange
+  names(GeneList[[names(res_shrunk)[i]]]) <- as.character(genelist$entrezgene_id)
+  GeneList[[names(res_shrunk)[i]]] <- sort(GeneList[[names(res_shrunk)[i]]], decreasing = T)
+}
+
+```
+
+## Msigdb gene set analysis using enricher and GSEA
+
+```{r Msigdb gene set analysis}
+msigdbr_species()
+msigdbr_collections()
+
+msigHs_c2 <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  select(gs_name, entrez_gene) %>% 
+  as.data.frame()
+
+msigHs_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, entrez_gene) %>% 
+  as.data.frame()
+
+enricher_hallmark <- list()
+enricher_hallmark_df <- list()
+for (i in 1:length(shrunk_sig)){
+print(names(shrunk_sig)[i])
+  enrich <- enricher(gene = shrunk_sig[[i]]$entrezgene_id, 
+                   TERM2GENE = msigHs_h,
+                   pvalueCutoff = 1,
+                   pAdjustMethod = "BH",
+                   minGSSize = 10,
+                   maxGSSize = 500)
+  enricher_hallmark[[names(shrunk_sig)[i]]] <- enrich
+  enricher_hallmark_df[[names(shrunk_sig)[i]]] <- enrich %>% as.data.frame() 
+}
+
+enricher_hallmark_sig1 <- list()
+for (i in 1:length(enricher_hallmark)) {
+    enricher_hallmark_sig1[[names(enricher_hallmark)[i]]] <- enricher_hallmark_df[[i]] %>% dplyr::filter(p.adjust<0.1) 
+    enricher_hallmark_sig1[["summary"]] <- rbind(enricher_hallmark_sig1[["summary"]], enricher_hallmark_sig1[[i]] %>% mutate(chemical=names(enricher_hallmark_sig1)[i]))
+}
+
+
+enricher_c2 <- list()
+enricher_c2_df <- list()
+for (i in 1:length(shrunk_sig)){
+print(names(shrunk_sig)[i])
+  enrich <- enricher(gene = shrunk_sig[[i]]$entrezgene_id, 
+                   TERM2GENE = msigHs_c2,
+                   pvalueCutoff = 1,
+                   pAdjustMethod = "BH",
+                   minGSSize = 10,
+                   maxGSSize = 500)
+  enricher_c2[[names(shrunk_sig)[i]]] <- enrich 
+  enricher_c2_df[[names(shrunk_sig)[i]]] <- enrich %>% as.data.frame() 
+}
+
+enricher_c2_sig <- list()
+for (i in 1:length(enricher_c2)) {
+enricher_c2_sig[[names(enricher_c2)[i]]] <- enricher_c2_df[[i]] %>% filter(p.adjust<0.05)
+ enricher_c2_sig[["summary"]] <- rbind(enricher_c2_sig[["summary"]], enricher_c2_sig[[i]] %>% mutate(chemical=names(enricher_c2_sig)[i]))
+}
+
+GSEA_hallmark <- list()
+GSEA_hallmark_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- GSEA(geneList = GeneList[[i]], minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+  GSEA_hallmark[[names(GeneList)[i]]] <- edo 
+  GSEA_hallmark_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+for (i in 1:length(GSEA_hallmark)) {
+  GSEA_hallmark[[i]] <- setReadable(GSEA_hallmark[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GSEA_hallmark, file = "/Users/tianyi.li.2/Desktop/POPs_project/results/tables/DESeq2_low_read_removed_all_expressed_genes_gsea_hallmark_20230213.xlsx")
+
+GSEA_hallmark_sig <- list()
+for (i in 1:length(GSEA_hallmark)) {
+  GSEA_hallmark_sig[[names(GSEA_hallmark)[i]]] <- GSEA_hallmark_df[[i]] %>% filter(p.adjust<0.05)
+  GSEA_hallmark_sig[["summary"]] <- rbind(GSEA_hallmark_sig[["summary"]], GSEA_hallmark_sig[[i]] %>%    
+                                            mutate(chemical=names(GSEA_hallmark_sig)[i]))
+}
+
+
+GSEA_c2 <- list()
+GSEA_c2_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- GSEA(geneList = GeneList[[i]], minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_c2)
+  GSEA_c2[[names(GeneList)[i]]] <- edo 
+  GSEA_c2_df[[names(GeneList)[i]]] <- edo %>% as.data.frame() 
+}
+
+for (i in 1:length(GSEA_c2)) {
+  GSEA_c2[[i]] <- setReadable(GSEA_c2[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GSEA_c2_sig, file = "/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_low_read_removed_all_expressed_genes_gsea_C2_sig_20231002.xlsx")
+
+GSEA_c2_sig <- list()
+for (i in 1:length(GSEA_c2)) {
+  GSEA_c2_sig[[names(GSEA_c2)[i]]] <- GSEA_c2[[i]]@result %>% filter(pvalue<0.05)
+  GSEA_c2_sig[["summary"]] <- rbind(GSEA_c2_sig[["summary"]], GSEA_c2_sig[[i]] %>% mutate(chemical=names(GSEA_c2_sig)[i]))
+}
+
+for (i in 1:length(GSEA_c2_sig)) {
+  GSEA_c2_sig[[i]] <- setReadable(GSEA_c2_sig[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+```
+
+## Overall GSEA results plotting
+
+```{r GSEA plotting}
+
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+kgn <- read_excel_allsheets("/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_low_read_removed_all_expressed_genes_gsea_hallmark_20230213.xlsx")
+
+deg_df <- data.frame()
+for (i in names(kgn)){
+  deg <- kgn[[i]] %>% mutate(group = rep(i, nrow(kgn[[i]])))
+  deg_df <- rbind(deg_df, deg) 
+}
+
+set <- deg_df %>% 
+  mutate(cellline = (ifelse(str_detect(.$group, "COV"), "COV434", 
+         ifelse(str_detect(.$group, "KGN"), "KGN", 
+                ifelse(str_detect(.$group, "PA"), "PA1", "Primary"))))) %>% 
+  mutate(chemical = (ifelse(str_detect(.$group, "HCB"), "HCB", 
+                            ifelse(str_detect(.$group, "DDE"), "DDE",
+                                   ifelse(str_detect(.$group, "PCB_156"), "PCB_156",
+                                          ifelse(str_detect(.$group, "PCB_180"), "PCB_180",
+                                                 ifelse(str_detect(.$group, "PFOS"), "PFOS", "Mix")))))))
+
+#set <- set %>% filter(cellline == "KGN") %>% filter(pvalue < 0.05)
+set <- set %>% mutate(conc = ifelse(str_detect(group, "100X"), "100X",
+                                    ifelse(str_detect(group, "10X"), "10X", "1X")))
+
+set %>% filter(conc == "100X") %>% 
+  filter(cellline != "PA1") %>% 
+  ggplot(aes(x = group, y = ID, col = NES)) + geom_point(size = 4) + theme +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red")
+
+ggplot(set, aes(x = group, y = ID, col = NES)) + geom_point(size = 4) + theme +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red")
+
+set %>% filter(conc == "1X") %>% 
+  filter(cellline != "PA1") %>% 
+  ggplot(aes(x = group, y = ID, col = NES)) + geom_point(size = 4) + theme +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red")
+
+## Plot selected pathways
+selected <- c("HALLMARK_OXIDATIVE_PHOSPHORYLATION",
+              "HALLMARK_GLYCOLYSIS", "HALLMARK_PI3K_AKT_MTOR_SIGNALING", "HALLMARK_MTORC1_SIGNALING",
+              #"HALLMARK_APOPTOSIS", 
+              "HALLMARK_REACTIVE_OXYGEN_SPECIES_PATHWAY", 
+               "HALLMARK_FATTY_ACID_METABOLISM",
+              "HALLMARK_CHOLESTEROL_HOMEOSTASIS")
+
+d1 <- set %>% filter(ID %in% selected) %>% 
+  filter(cellline == "KGN") 
+d1$group <- factor(d1$group, levels = c("KGN_HCB_1X", "KGN_HCB_10X", "KGN_HCB_100X",
+                                           "KGN_DDE_1X", "KGN_DDE_10X", "KGN_DDE_100X",
+                                           "KGN_PCB_156_1X", "KGN_PCB_156_10X", "KGN_PCB_156_100X",
+                                           "KGN_PCB_180_1X", "KGN_PCB_180_10X", "KGN_PCB_180_100X",
+                                           "KGN_PFOS_1X", "KGN_PFOS_10X", "KGN_PFOS_100X",
+                                           "KGN_MIX_1X", "KGN_MIX_10X", "KGN_MIX_100X")) 
+d1 %>% 
+  ggplot(aes(x = group, y = ID, col = NES)) + geom_point(aes(size = -log10(pvalue))) + theme +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red") + xlab("") + ylab("")
+
+# correlation of NES in selected pathways among each exposure group in KGN
+d3 <- d1 %>% select(ID, group, NES) %>% 
+  pivot_wider(names_from = "group", values_from = "NES") %>% 
+  as.data.frame()
+rownames(d3) <- d3$ID
+d3 <- d3[,-1] 
+colnames(d3) <- gsub("KGN_", "", colnames(d3))
+
+orders <- c("HCB_1X", "HCB_10X", 
+            "HCB_100X", "DDE_1X", "DDE_10X", 
+            "DDE_100X",  "PCB_156_1X", "PCB_156_10X",  
+            "PCB_156_100X",  "PCB_180_1X", "PCB_180_10X",
+            "PCB_180_100X", "PFOS_1X", "PFOS_10X", 
+            "PFOS_100X", "MIX_1X", "MIX_10X",
+            "MIX_100X")
+d3 <- d3[, match(orders, colnames(d3))]
+
+cor3 <- cor(d3)
+res <- corrplot::cor.mtest(d3, conf.level = 0.95)
+p <- res$p
+mycol <- colorRampPalette(c("#06a7cd", "white", "#e74a32"), alpha = T)
+corrplot::corrplot(cor3, type = "upper", outline = "grey",
+                   #order = c("AOE"), 
+                   col = mycol(100), diag = T, tl.col = "black",
+                   p.mat = p, sig.level = c(0.001, 0.01, 0.05),
+                   insig = "label_sig",
+                   pch.cex = 1.2,
+                   pch.col = "black")
+
+# GSEA with all the cell types
+d2 <- set %>% filter(ID %in% selected)
+d2$group <- factor(d2$group, levels = c("COV_HCB_1X", "COV_HCB_10X", "COV_HCB_100X",
+                                           "COV_DDE_1X", "COV_DDE_10X", "COV_DDE_100X",
+                                           "COV_PCB_156_1X", "COV_PCB_156_100X",
+                                           "COV_PCB_180_1X", "COV_PCB_180_10X", "COV_PCB_180_100X",
+                                           "COV_PFOS_1X", "COV_PFOS_10X", "COV_PFOS_100X",
+                                           "COV_MIX_1X", "COV_MIX_10X", "COV_MIX_100X",
+                                        "KGN_HCB_1X", "KGN_HCB_10X", "KGN_HCB_100X",
+                                           "KGN_DDE_1X", "KGN_DDE_10X", "KGN_DDE_100X",
+                                           "KGN_PCB_156_1X", "KGN_PCB_156_10X", "KGN_PCB_156_100X",
+                                           "KGN_PCB_180_1X", "KGN_PCB_180_10X", "KGN_PCB_180_100X",
+                                           "KGN_PFOS_1X", "KGN_PFOS_10X", "KGN_PFOS_100X",
+                                           "KGN_MIX_1X", "KGN_MIX_10X", "KGN_MIX_100X",
+                                        "PA_HCB_1X", "PA_HCB_10X", "PA_HCB_100X",
+                                           "PA_DDE_1X", "PA_DDE_10X", "PA_DDE_100X",
+                                           "PA_PCB_156_1X", "PA_PCB_156_10X", "PA_PCB_156_100X",
+                                           "PA_PCB_180_1X", "PA_PCB_180_10X", "PA_PCB_180_100X",
+                                           "PA_PFOS_1X", "PA_PFOS_10X", "PA_PFOS_100X",
+                                           "PA_MIX_1X", "PA_MIX_10X", "PA_MIX_100X",
+                                        "Primary_HCB_1X", "Primary_HCB_10X", "Primary_HCB_100X",
+                                           "Primary_DDE_1X", "Primary_DDE_10X", "Primary_DDE_100X",
+                                           "Primary_PCB_156_1X", "Primary_PCB_156_10X", "Primary_PCB_156_100X",
+                                           "Primary_PCB_180_1X", "Primary_PCB_180_10X", "Primary_PCB_180_100X",
+                                           "Primary_PFOS_1X", "Primary_PFOS_10X", "Primary_PFOS_100X",
+                                           "Primary_MIX_1X", "Primary_MIX_10X", "Primary_MIX_100X")) 
+
+ggplot(d2, aes(x = group, y = ID, col = NES)) + geom_point(aes(size = -log10(pvalue))) + theme +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red") + 
+  theme(axis.text.x=element_text(color="black", angle = 90, hjust= 1)) + xlab("") + ylab("") 
+
+## Select Ferroptosis signaling from C2 GSEA analysis
+kgn <- read_excel_allsheets("/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_low_read_removed_all_expressed_genes_gsea_C2_sig_20231002.xlsx")
+
+kgn <- kgn[["summary"]]
+kgn <- kgn %>% filter(ID == "WP_FERROPTOSIS")
+kgn <- kgn[str_detect(kgn$chemical, "KGN"),]
+
+```
+
+## Individual gene plotting
+
+```{r individual genes plot}
+
+d4 <- as.data.frame(c("SCD", "DHCR7", "YWHAE", "HNRNPH1", "CTNNB1", "PSPH",
+                      "MAPKAP1", "SOX4", "HGF", "YWHAG", "IGF2BP1", "CNN3", "CNN1")) %>% 
+  'colnames<-' ("gene")
+
+d4 <- merge(d4, output, by.x = "gene", by.y = "external_gene_name", all.x = T, all.y = F)
+
+id <- c("COV_DMSO_DMSO", "COV_HCB_1X", "COV_HCB_10X", "COV_HCB_100X",
+        "KGN_DMSO_DMSO", "KGN_HCB_1X", "KGN_HCB_10X", "KGN_HCB_100X",
+        "PA_DMSO_DMSO", "PA_HCB_1X", "PA_HCB_10X", "PA_HCB_100X",
+        "Primary_DMSO_DMSO", "Primary_HCB_1X", "Primary_HCB_10X", "Primary_HCB_100X")
+id <- c("COV_DMSO_DMSO", "COV_DDE_1X", "COV_DDE_10X", "COV_DDE_100X",
+        "KGN_DMSO_DMSO", "KGN_DDE_1X", "KGN_DDE_10X", "KGN_DDE_100X",
+        "PA_DMSO_DMSO", "PA_DDE_1X", "PA_DDE_10X", "PA_DDE_100X",
+        "Primary_DMSO_DMSO", "Primary_DDE_1X", "Primary_DDE_10X", "Primary_DDE_100X")
+id <- c("COV_DMSO_DMSO", "COV_PCB_156_1X", "COV_PCB_156_100X",
+        "KGN_DMSO_DMSO", "KGN_PCB_156_1X", "KGN_PCB_156_10X", "KGN_PCB_156_100X",
+        "PA_DMSO_DMSO", "PA_PCB_156_1X", "PA_PCB_156_10X", "PA_PCB_156_100X",
+        "Primary_DMSO_DMSO", "Primary_PCB_156_1X", "Primary_PCB_156_10X", "Primary_PCB_156_100X")
+id <- c("COV_DMSO_DMSO", "COV_PCB_180_1X", "COV_PCB_180_10X", "COV_PCB_180_100X",
+        "KGN_DMSO_DMSO", "KGN_PCB_180_1X", "KGN_PCB_180_10X", "KGN_PCB_180_100X",
+        "PA_DMSO_DMSO", "PA_PCB_180_1X", "PA_PCB_180_10X", "PA_PCB_180_100X",
+        "Primary_DMSO_DMSO", "Primary_PCB_180_1X", "Primary_PCB_180_10X", "Primary_PCB_180_100X")
+id <- c("COV_DMSO_DMSO", "COV_PFOS_1X", "COV_PFOS_10X", "COV_PFOS_100X",
+        "KGN_DMSO_DMSO", "KGN_PFOS_1X", "KGN_PFOS_10X", "KGN_PFOS_100X",
+        "PA_DMSO_DMSO", "PA_PFOS_1X", "PA_PFOS_10X", "PA_PFOS_100X",
+        "Primary_DMSO_DMSO", "Primary_PFOS_1X", "Primary_PFOS_10X", "Primary_PFOS_100X")
+id <- c("COV_DMSO_DMSO", "COV_MIX_1X", "COV_MIX_10X", "COV_MIX_100X",
+        "KGN_DMSO_DMSO", "KGN_MIX_1X", "KGN_MIX_10X", "KGN_MIX_100X",
+        "PA_DMSO_DMSO", "PA_MIX_1X", "PA_MIX_10X", "PA_MIX_100X",
+        "Primary_DMSO_DMSO", "Primary_MIX_1X", "Primary_MIX_10X", "Primary_MIX_100X")
+des <- list()
+for (i in 1: nrow(d4)) {
+  geneID <- d4[i,2]
+  gene_name <- d4[i,1]
+  if (!geneID %in% rownames(dataset[["dds_MIX"]]@assays@data$counts)) next
+  d3 <- plotCounts(dataset[["dds_MIX"]], gene=geneID, intgroup=c("group"), normalized = T,
+                  returnData=TRUE) 
+  d3$group <- factor(d3$group, levels = id)
+  des[[gene_name]] <- ggplot(d3, aes(x=group, y=count, fill = group)) + 
+    geom_boxplot()  + 
+    geom_point(size=2, alpha = 0.5) + xlab("") + ylab("normalized count") +
+    theme + ggtitle(paste0(gene_name, " - MIX"))
+}
+wrap_plots(des, ncol = 5)
+
+
+d3 <- plotCounts(dataset[["dds_MIX"]], gene="ENSG00000106144", intgroup=c("group"), normalized = T,
+                  returnData=TRUE) 
+ggplot(d3, aes(x=group, y=count, fill = group)) + 
+    geom_boxplot()  + 
+    geom_point(size=2, alpha = 0.5) + xlab("") + ylab("normalized count") +
+    theme + ggtitle("CASP2")
+
+```
+
+## Heatmap for selected genes
+
+```{r heatmap for selected genes}
+
+# Selected biomarkers
+#bio <- c("ENSG00000099194", "ENSG00000172893", "ENSG00000189403") # SCD, DHCR7, HMGB1, respectively
+#bio <- c("ENSG00000074800", "ENSG00000134333",
+#         "ENSG00000152234", "ENSG00000131143", "ENSG00000186951",
+#         "ENSG00000132170", #"ENSG00000100644", #"ENSG00000106546",
+#         "ENSG00000142168", "ENSG00000167468") # ENO1, LDHA, ATP5F1A, COX4I1, PPARA, PPARG, HIF1A, AHR, SOD1, GPX4
+bio <- c("ENSG00000074800", "ENSG00000134333",
+         "ENSG00000152234", "ENSG00000131143", 
+         "ENSG00000142168", "ENSG00000167468") # ENO1, LDHA, ATP5F1A, COX4I1, SOD1, GPX4
+#bio <- c("ENSG00000116044", "ENSG00000189403", "ENSG00000167468",
+#         "ENSG00000167996", "ENSG00000151012") # NRF2/NFE2L2, HMGB1, GPX4, FTH1, SLC7A11
+
+kg <- info %>% filter(cell_line == "KGN") %>% filter(exposure != "media")
+# Remove 10X group
+kg <- kg %>% filter(conc != "10X")
+selected <- cells[rownames(cells) %in% bio, colnames(cells) %in% kg$sample]
+
+# Scale the dataset
+scaleSTAT <- scale(t(selected), scale = T, center = T) %>% t() %>%
+               as.data.frame()
+rownames(scaleSTAT) <- c("DHCR7", "SCD", "HMGB1")
+#rownames(scaleSTAT) <- c("ENO1", "PPARG", #"AHR", 
+#                         "LDHA", #"HIF1A", 
+#                         "COX4I1", "ATP5F1A", 
+#                         "GPX4", "PPARA", "SOD1")
+rownames(scaleSTAT) <- c("ENO1",   
+                        "LDHA", "COX4I1", "ATP5F1A", 
+                        "GPX4", "SOD1")
+#rownames(scaleSTAT) <- c("NFE2L2", "SLC7A11", "FTH1", "HMGB1", "GPX4")
+
+anno <- kg %>% select(sample, chemical, conc)
+rownames(anno) <- anno$sample
+anno <- anno[, -1]
+
+colnames(scaleSTAT) <- kg$group
+new_cols <- unique(colnames(scaleSTAT))
+
+# Get the average expression among three biological replicates
+df <- sapply(seq(1, ncol(scaleSTAT), 3), function(j) {
+  if (j < 28) {
+    # if keep 10x group, then j < 43
+    base::rowMeans(scaleSTAT[, j+(0:2)])
+  } else if (j == 28) { 
+    base::rowMeans(scaleSTAT[, j+(0:1)]) } else {
+      base::rowMeans(scaleSTAT[, j-1+(0:2)])
+    }
+  }) %>% 
+  as.data.frame() %>% 
+  set_names(new_cols)
+
+anno$group <- paste0("KGN_", anno$chemical, "_", anno$conc)
+anno <- anno %>% select(chemical, group) %>% unique()
+rownames(anno) <- anno$group
+
+gaps <- match(unique(kg$chemical), anno$chemical)[-1]
+gaps <- gaps - 1
+
+# Move the last column to the first column
+#new_df <- df %>%
+#  select(KGN_DMSO_DMSO, everything())
+
+#new_anno <- anno %>% t() %>% as.data.frame() %>% 
+#  select(KGN_DMSO_DMSO, everything()) %>% t() %>% as.data.frame()
+
+anno$chemical <- factor(anno$chemical, levels = c("DMSO", "HCB", "DDE", "PCB_156", "PCB_180", "PFOS", "MIX"))
+orders <- c("KGN_HCB_1X", #"KGN_HCB_10X", 
+            "KGN_HCB_100X", "KGN_DDE_1X", 
+            #"KGN_DDE_10X", 
+            "KGN_DDE_100X",  "KGN_PCB_156_1X", #"KGN_PCB_156_10X", 
+            "KGN_PCB_156_100X",  "KGN_PCB_180_1X",# "KGN_PCB_180_10X",
+            "KGN_PCB_180_100X", "KGN_PFOS_1X", #"KGN_PFOS_10X", 
+            "KGN_PFOS_100X", "KGN_MIX_1X", #"KGN_MIX_10X", 
+            "KGN_MIX_100X", "KGN_DMSO_DMSO")
+new_df <- df[, match(orders, colnames(df))]
+
+gene_order <- c("ENO1", "LDHA", "COX4I1", "ATP5F1A", "SOD1", "GPX4", "PPARA", "HIF1A", "PPARG")
+gene_order <- c("ENO1", "LDHA", "COX4I1", "ATP5F1A", "SOD1", "GPX4")
+new_df <- new_df[match(gene_order, rownames(new_df)),]
+
+ComplexHeatmap::Heatmap(as.matrix(new_df), name = "Scale",
+        cluster_columns = F,
+        cluster_rows = F,
+        #clustering_distance_rows = "euclidean",
+        show_row_names = T,
+        column_split = anno$chemical,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## Heatmap of log2FC of selected markers
+
+```{r Heatmap of log2FC}
+
+markers <- c("ENO1", #"PPARG", 
+             "LDHA", #"HIF1A", 
+             "COX4I1", 
+             "ATP5F1A", "GPX4", #"PPARA", 
+             "SOD1")
+markers <- c("SCD", "DHCR7")
+markers <- c(#"HIF1A", 
+             "PPARG")
+
+ids <- which(str_detect(names(finalALL), "KGN"))
+kgn_list <- finalALL[ids]
+
+# remove 10x
+id_10x <- which(str_detect(names(kgn_list), "10X"))
+kgn_list <- kgn_list[-id_10x]
+
+temp1 <- kgn_list[[1]] %>% 
+    filter(external_gene_name %in% markers) %>% 
+    mutate(group = rep(names(kgn_list[1]), nrow(.)))
+df <- temp1
+
+for (i in 2:length(kgn_list)) {
+  temp1 <- kgn_list[[i]] %>% 
+    filter(external_gene_name %in% markers) %>% 
+    mutate(group = rep(names(kgn_list[i]), nrow(.)))
+  df <- rbind(df, temp1)
+}
+
+df_sub <- df %>% select(log2FoldChange, external_gene_name, group)
+
+# Replace first 9 row as DMSO, 6 if not include upstream regulators
+#df_sub$group[1:6] <- rep("KGN_DMSO", 6)
+#df_sub$log2FoldChange[1:6] <- rep(0, 6)
+
+# Convert to wide format for heatmap plotting
+df_wide <- df_sub %>% pivot_wider(names_from = "external_gene_name", values_from = "log2FoldChange")
+df_wide$group <- gsub("KGN_", "", df_wide$group)
+df_wide <- as.data.frame(df_wide) 
+rownames(df_wide) <- df_wide$group
+df_wide <- df_wide[,-1] %>% t()
+
+orders <- c("HCB_1X", 
+            "HCB_100X", "DDE_1X", 
+            "DDE_100X",  "PCB_156_1X",  
+            "PCB_156_100X",  "PCB_180_1X",
+            "PCB_180_100X", "PFOS_1X", 
+            "PFOS_100X", "MIX_1X",
+            "MIX_100X")
+df_wide <- df_wide[, match(orders, colnames(df_wide))]
+
+anno <- as.data.frame(orders)
+anno$chemical <- ifelse(str_detect(anno$orders, "HCB"), "HCB", 
+                            ifelse(str_detect(anno$orders, "DDE"), "DDE",
+                                   ifelse(str_detect(anno$orders, "PCB_156"), "PCB156",
+                                          ifelse(str_detect(anno$orders, "PCB_180"), "PCB180",
+                                                 ifelse(str_detect(anno$orders, "PFOS"), "PFOS", 
+                                                        ifelse(str_detect(anno$orders, "MIX"), "MIX", "DMSO"))))))
+rownames(anno) <- anno$orders
+anno$chemical <- factor(anno$chemical, levels = c("HCB", "DDE", "PCB156", "PCB180", "PFOS", "MIX"))
+
+gene_order <- c("ENO1", "LDHA", "COX4I1", "ATP5F1A", "SOD1", "GPX4")
+gene_order <- c("SCD", "DHCR7")
+df_wide <- df_wide[match(gene_order, rownames(df_wide)),]
+
+col_fun <- circlize::colorRamp2(breaks = c(-2, 0, 2), c("blue", "white", "red"))
+ComplexHeatmap::Heatmap(as.matrix(df_wide), name = "Log2FC",
+        cluster_columns = F,
+        cluster_rows = F,
+        #clustering_distance_rows = "euclidean",
+        show_row_names = T,
+        column_split = anno$chemical,
+        col = col_fun)
+
+# Color starts from white for SCD and DHCR7
+col_fun <- circlize::colorRamp2(breaks = c(-6, 0, 6), c("blue", "white", "red"))
+ComplexHeatmap::Heatmap(as.matrix(df_wide), name = "Log2FC",
+        cluster_columns = F,
+        cluster_rows = F,
+        #clustering_distance_rows = "euclidean",
+        show_row_names = T,
+        column_split = anno$chemical,
+        col = col_fun)
+
+# Barplot for PPARG
+df_wide$group <- factor(df_wide$group, levels = orders)
+df_wide$chemical <- ifelse(str_detect(df_wide$group, "HCB"), "HCB", 
+                            ifelse(str_detect(df_wide$group, "DDE"), "DDE",
+                                   ifelse(str_detect(df_wide$group, "PCB_156"), "PCB156",
+                                          ifelse(str_detect(df_wide$group, "PCB_180"), "PCB180",
+                                                 ifelse(str_detect(df_wide$group, "PFOS"), "PFOS", 
+                                                        ifelse(str_detect(df_wide$group, "MIX"), "MIX", "DMSO"))))))
+ggplot(df_wide, aes(x = group, y = PPARG, fill = chemical)) + geom_bar(stat = "identity") + theme_bw() +
+  scale_fill_npg() + ggtitle("PPARG - RNAseq") + ylab("Log2 Fold Change") + 
+  theme(axis.text.x=element_text(color="black", angle = 45, hjust= 1))
+
+```
+
+
+## enrichGO and gseGO
+
+```{r}
+enrich_GO <- list()
+enrich_GO_df <- list()
+for (i in 1:length(shrunk_sig)){
+print(names(shrunk_sig)[i])
+  enrich <- enrichGO(gene = shrunk_sig[[i]]$entrezgene_id, 
+                   universe=names(GeneList[[i]]),
+                   OrgDb         = org.Hs.eg.db,
+                   ont           = "BP",
+                   pvalueCutoff = 1,
+                   pAdjustMethod = "BH",
+                   readable = T)
+  enrich_GO[[names(shrunk_sig)[i]]] <- enrich 
+  enrich_GO_df[[names(shrunk_sig)[i]]] <- enrich %>% as.data.frame() 
+}
+
+names(GeneList[[1]])
+enrich_GO_sig <- list()
+for (i in 1:length(enrich_GO)) {
+enrich_GO_sig[[names(enrich_GO)[i]]] <- enrich_GO_df[[i]] %>% filter(p.adjust<0.05)
+ enrich_GO_sig[["summary"]] <- rbind(enrich_GO_sig[["summary"]], enrich_GO_sig[[i]] %>% mutate(chemical=names(enrich_GO_sig)[i]))
+}
+write.xlsx(enrich_GO_df, "enrich_GO_df.xlsx")
+write.xlsx(enrich_GO_comb_df, "enrich_GO_comb_df.xlsx")
+
+
+enrich_GO_comb_sig <- list()
+for (i in 1:length(enrich_GO_comb)) {
+enrich_GO_comb_sig[[names(enrich_GO_comb)[i]]] <- enrich_GO_comb_df[[i]] %>% filter(p.adjust<0.05)
+enrich_GO_comb_sig[["summary"]] <- rbind(enrich_GO_comb_sig[["summary"]], enrich_GO_comb_sig[[i]] %>% mutate(chemical=names(enrich_GO_comb_sig)[i]))
+}
+
+gse_GO <- list()
+gse_GO_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- gseGO(geneList = GeneList[[i]], 
+              OrgDb        = org.Hs.eg.db,
+              ont          = "BP",
+              nPerm        = 1000,
+              minGSSize    = 10,
+              maxGSSize    = 500,
+              pvalueCutoff = 1,
+              verbose      = FALSE)
+  gse_GO[[names(GeneList)[i]]] <- edo 
+  gse_GO_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+for (i in 1:length(gse_GO)) {
+  gse_GO[[i]] <- setReadable(gse_GO[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+write.xlsx(gse_GO, file = "/Users/tianyi.li.2/Desktop/POPs_project/results/tables/DESeq2_gse_GO_all_expressed_genes_20221016.xlsx")
+
+gse_GO_sig <- list()
+for (i in 1:length(gse_GO)) {
+gse_GO_sig[[names(gse_GO)[i]]] <- gse_GO_df[[i]] %>% filter(p.adjust<0.05)
+gse_GO_sig[["summary"]] <- rbind(gse_GO_sig[["summary"]], gse_GO_sig[[i]] %>% mutate(chemical=names(gse_GO_sig)[i]))
+}
+```
+
+## enrichKEGG and gseKEGG
+
+```{r}
+enrich_KEGG <- list()
+enrich_KEGG_df <- list()
+for (i in 1:length(shrunk_sig)){
+print(names(shrunk_sig)[i])
+  enrich <- enrichKEGG(gene = shrunk_sig[[i]]$entrezgene_id, 
+                   organism     = 'hsa',
+                 pvalueCutoff = 1)
+  enrich_KEGG[[names(shrunk_sig)[i]]] <- enrich 
+  enrich_KEGG_df[[names(shrunk_sig)[i]]] <- enrich %>% as.data.frame() 
+}
+
+enrich_KEGG_sig <- list()
+for (i in 1:length(enrich_KEGG)) {
+enrich_KEGG_sig[[names(enrich_KEGG)[i]]] <- enrich_KEGG_df[[i]] %>% filter(p.adjust<0.05)
+ enrich_KEGG_sig[["summary"]] <- rbind(enrich_KEGG_sig[["summary"]], enrich_KEGG_sig[[i]] %>% mutate(chemical=names(enrich_KEGG_sig)[i]))
+}
+
+enrich_KEGG_comb <- list()
+enrich_KEGG_comb_df <- list()
+for(i in cell_line) {
+for(j in chemical2) {
+  set1 <- shrunk_sig[[paste0(i,"_",j,"_100X")]]$entrezgene_id
+  set1 <- set1[which(set1 != "")]
+  set2 <- shrunk_sig[[paste0(i,"_",j,"_10X")]]$entrezgene_id
+  set2 <- set2[which(set2 != "")]
+  set3 <- shrunk_sig[[paste0(i,"_",j,"_1X")]]$entrezgene_id
+  set3 <- set3[which(set3 != "")]
+  total_sig <- unique(c(set1,set2,set3))
+  print(paste0(i," ",j))
+  enrich <- enrichKEGG(gene = total_sig, 
+                  organism     = 'hsa',
+                 pvalueCutoff = 1)
+  enrich_KEGG_comb[[paste0(i," ",j)]] <- enrich 
+  enrich_KEGG_comb_df[[paste0(i," ",j)]] <- enrich %>% as.data.frame() 
+}
+} 
+
+enrich_KEGG_comb_sig <- list()
+for (i in 1:length(enrich_KEGG_comb)) {
+enrich_KEGG_comb_sig[[names(enrich_KEGG_comb)[i]]] <- enrich_KEGG_comb_df[[i]] %>% filter(p.adjust<0.05)
+enrich_KEGG_comb_sig[["summary"]] <- rbind(enrich_KEGG_comb_sig[["summary"]], enrich_KEGG_comb_sig[[i]] %>% mutate(chemical=names(enrich_KEGG_comb_sig)[i]))
+}
+
+gse_KEGG <- list()
+gse_KEGG_df <- list()
+for(i in 1:length(GeneList)){
+print(names(GeneList)[i])
+  edo <- gseKEGG(geneList = GeneList[[i]], 
+                organism     = 'hsa',
+               nPerm        = 1000,
+               minGSSize    = 10,
+               pvalueCutoff = 1,
+               verbose      = FALSE)
+gse_KEGG[[names(GeneList)[i]]] <- edo 
+gse_KEGG_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+gse_KEGG_sig <- list()
+for (i in 1:length(gse_KEGG)) {
+gse_KEGG_sig[[names(gse_KEGG)[i]]] <- gse_KEGG_df[[i]] %>% filter(p.adjust<0.05)
+gse_KEGG_sig[["summary"]] <- rbind(gse_KEGG_sig[["summary"]], gse_KEGG_sig[[i]] %>% mutate(chemical=names(gse_KEGG_sig)[i]))
+}
+```
+
+## Expression of marker in scRNAseq data and metabolism
+
+```{r marker expression}
+
+library(Seurat)
+cort <- readRDS("/Users/tili/Desktop/PhD/POPs/data/Unsorted_Manuscript figures.rds")
+
+marker <- c("ENO1", "LDHA", "COX4I1", "ATP5A1", "SOD1", "GPX4", 
+            "PPARA", "PPARG", #"HIF1A", # "AHR",
+            #"GPX1", "CAT",
+            "SCD", "DHCR7")
+            #, "HMGB1")
+
+cort <- RenameIdents(cort, "1_oocytes" = "Oocytes", "2_immune" = "Immune", "3_gran" = "Granulosa",
+                     "4_endo" = "Endothelial", "5_pv" = "Perivascular", "6_stroma" = "Stroma")
+
+cort@active.ident <- factor(cort@active.ident, levels = c("Endothelial",
+                                                                    "Granulosa", "Immune",
+                                                                    "Oocytes", "Perivascular", "Stroma"))
+cort <- AddMetaData(cort, cort@active.ident, col.name = "cluster")
+DotPlot(cort, features = marker) + coord_flip() + ylab("") + xlab("")
+
+# scMetabolism
+countexp <- sc.metabolism.Seurat(obj = cort, method = "VISION", 
+                                      imputation = F, ncores = 4, metabolism.type = "KEGG")
+
+# Extract the metabolism score
+metabolism.matrix <- countexp@assays$METABOLISM$score %>% t() %>% as.data.frame()
+metabolism.matrix$cellid <- rownames(metabolism.matrix)
+
+
+# Visualization
+DimPlot.metabolism(obj = countexp, pathway = "Glycolysis / Gluconeogenesis", 
+                   dimention.reduction.type = "umap", dimention.reduction.run = F, size = 1)
+
+input.pathway <- c("Glycolysis / Gluconeogenesis", "Oxidative phosphorylation")
+DotPlot.metabolism(obj = countexp, pathway = input.pathway, phenotype = "cluster")
+
+```
+
+## Cancer cell line vs primary cells comparison
+
+```{r KGN metabolic profile}
+
+# Selected biomarkers
+#bio <- c("ENSG00000074800", "ENSG00000134333",
+#         "ENSG00000152234", "ENSG00000131143", "ENSG00000186951",
+#         "ENSG00000132170", "ENSG00000100644", "ENSG00000106546",
+#         "ENSG00000142168", "ENSG00000167468") # ENO1, LDHA, ATP5F1A, COX4I1, PPARA, PPARG, HIF1A, AHR, SOD1, GPX4
+
+kg <- info %>% filter(exposure == "media") %>% 
+  filter(conc == "MEDIA")
+
+# Set primary cell as reference
+kg$cell_line <- factor(kg$cell_line)
+kg$cell_line <- relevel(kg$cell_line, ref = "Primary")
+
+kg <- kg %>% filter(!sample %in% c("MEDIA_COV_P29A_P2", "MEDIA_COV_P29A_P3", "MEDIA_KGN_P12A_P2", "MEDIA_KGN_P12A_P4"))
+
+selected <- cells[, colnames(cells) %in% kg$sample]
+
+dds <- DESeqDataSetFromMatrix(countData=selected, colData = kg, design = ~ cell_line)
+
+# Keep only the expressed genes at least in 3 samples
+keep <- rowSums(counts(dds) > 1) >= 3
+dds <- dds[keep,]
+
+# PCA for all the media samples and cell lines
+r <- vst(dds, blind = T)
+pca <- plotPCA(r, intgroup=c("cell_line"), returnData = T) 
+percentVar <- round(100 * attr(pca, "percentVar")) 
+ggplot(pca, aes(PC1, PC2, color=cell_line)) + 
+      ggtitle(paste0("PCA (vst)")) + theme_bw() +
+      geom_point(size = 3) + 
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) 
+
+# Plot library size per sample
+kg %>% mutate(read = colSums(counts(dds))) %>% 
+       ggplot(aes(x=sample, y=read)) + geom_bar(stat = "identity") + theme_bw() +
+      ggtitle("Sequences Read per Sample") + xlab("")
+
+# Correlation between samples
+r <- vst(dds, blind = T)
+r_cor <- cor(assay(r))
+df <- as.data.frame(colData(dds)[,c("cell_line", "conc", "group")])
+pheatmap(r_cor, scale = "column", show_rownames = T, annotation = df, fontsize = 8,
+         clustering_distance_cols = "manhattan", main = "Correlation Heatmap")
+
+
+# Perform differential expression analysis
+dds <- DESeq(dds)
+
+comparison_media <- list()
+gro <- levels(kg$cell_line)[levels(kg$cell_line) != "Primary"]
+for (j in gro) {
+    if (j %in% levels(kg$cell_line)){
+        print(paste0(j, "_vs_Primary"))
+        comparison_media[[paste0(j, "_vs_Primary")]] <- results(dds, 
+                                    contrast = c("cell_line", j, "Primary"), 
+                                    independentFiltering = T, pAdjustMethod = "fdr") %>% 
+                                  as.data.frame() %>% 
+                                  mutate(geneid = rownames(.))}
+    else { print(paste0(j," No result"))}       
+}  
+  
+#significant DEG
+comparison_media05 <- list()
+for (i in 1:length(comparison_media)) {
+  comparison_media05[[names(comparison_media)[i]]] <- comparison_media[[i]] %>% filter(padj<0.05)
+}
+
+get_id <- function(x) {
+  x$geneid <- rownames(x)
+  final <- merge(x, output, by.x = "geneid", by.y = "ensembl_gene_id", all.x = T, all.y = F)
+  return(final)
+}
+
+final_media <- lapply(comparison_media05, function(x) {
+  x <- get_id(x)
+})
+
+save(dds, comparison_media, comparison_media05, final_media, file = "/Users/tianyili/Desktop/POPs_project/results/DESeq2_media_sample_comparison_wo_replicates_sig05_20240105.Rdata")
+
+openxlsx::write.xlsx(final_media, file = "/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_cell_line_comparison_wo_replicates_sig05_20240105.xlsx")
+
+```
+
+## Shrunk for GSEA analysis
+
+```{r get shrunk data for media sample}
+
+res_shrunk_media <- list()
+for (j in gro) {
+    print(paste0(j, "_vs_Primary"))
+    res_shrunk_media[[paste0(j, "_vs_Primary")]] <- lfcShrink(dds, coef = match(paste0("cell_line_", j, "_vs_Primary"),   
+                                                                                  resultsNames(dds)), 
+                                      type = "apeglm") %>% as.data.frame() %>% mutate(geneid = rownames(.))
+} 
+
+shrunk_sig_media <- list()
+for (i in 1:length(res_shrunk_media)) {
+    shrunk_sig_media[[names(res_shrunk_media)[i]]] <- res_shrunk_media[[i]] %>% filter(padj<0.05)
+}
+
+```
+
+## Get background gene sets for media samples
+
+```{r get background genes for media samples}
+
+res_shrunk_media <- lapply(res_shrunk_media, function(x) {
+  x <- get_id(x)
+})
+
+shrunk_sig_media <- lapply(shrunk_sig_media, function(x) {
+  x <- get_id(x)
+})
+
+```
+
+## Get entrezgene id for functional analysis
+
+```{r get background genes for functional analysis}
+
+GeneList <- list()
+for(i in 1:length(shrunk_sig_media)){
+  genelist <- shrunk_sig_media[[i]] %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id)) %>% 
+    unique()
+  GeneList[[names(shrunk_sig_media)[i]]] <- genelist$log2FoldChange
+  names(GeneList[[names(shrunk_sig_media)[i]]]) <- as.character(genelist$entrezgene_id)
+  GeneList[[names(shrunk_sig_media)[i]]] <- sort(GeneList[[names(shrunk_sig_media)[i]]], decreasing = T)
+}
+
+# All expressed genes
+GeneList <- list()
+for(i in 1:length(res_shrunk_media)){
+  genelist <- res_shrunk_media[[i]] %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id)) %>% 
+    unique()
+  genelist <- genelist[-which(duplicated(genelist$entrezgene_id)),]
+  GeneList[[names(res_shrunk_media)[i]]] <- genelist$log2FoldChange
+  names(GeneList[[names(res_shrunk_media)[i]]]) <- as.character(genelist$entrezgene_id)
+  GeneList[[names(res_shrunk_media)[i]]] <- sort(GeneList[[names(res_shrunk_media)[i]]], decreasing = T)
+}
+
+```
+
+## Msigdb gene set analysis using enricher and GSEA
+
+```{r Msigdb gene set analysis}
+msigdbr_species()
+msigdbr_collections()
+
+msigHs_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, entrez_gene) %>% 
+  as.data.frame()
+
+enricher_hallmark <- list()
+enricher_hallmark_df <- list()
+for (i in 1:length(shrunk_sig_media)){
+  print(names(shrunk_sig_media)[i])
+  enrich <- enricher(gene = shrunk_sig_media[[i]]$entrezgene_id, 
+                   TERM2GENE = msigHs_h,
+                   pvalueCutoff = 1,
+                   pAdjustMethod = "BH",
+                   minGSSize = 10,
+                   maxGSSize = 500)
+  enricher_hallmark[[names(shrunk_sig_media)[i]]] <- enrich
+  enricher_hallmark_df[[names(shrunk_sig_media)[i]]] <- enrich %>% as.data.frame() 
+}
+
+
+GSEA_hallmark <- list()
+GSEA_hallmark_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- GSEA(geneList = GeneList[[i]], minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+  GSEA_hallmark[[names(GeneList)[i]]] <- edo 
+  GSEA_hallmark_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+for (i in 1:length(GSEA_hallmark)) {
+  GSEA_hallmark[[i]] <- setReadable(GSEA_hallmark[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GSEA_hallmark, file = "/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_media_samples_sig DEGs_gsea_hallmark_20231208.xlsx")
+
+openxlsx::write.xlsx(GSEA_hallmark, file = "/Users/tianyili/Desktop/POPs_project/results/tables/DESeq2_media_samples_all_expressed_genes_gsea_hallmark_20231208.xlsx")
+
+```
+
+
+## Venn diagram of overlap DEGs for media samples
+
+```{r Venn diagram for media samples}
+
+p1 <- VennDiagram::venn.diagram(
+  x = list(na.omit(final_media[["COV_vs_Primary"]]$geneid), na.omit(final_media[["KGN_vs_Primary"]]$geneid), 
+           na.omit(final_media[["PA_vs_Primary"]]$geneid)),
+  category.names = c("COV434" , "KGN", "PA1"),
+  filename = NULL, #'Venn for media samples four cell lines overlap sig05.png',
+  output=TRUE,
+  # Circles
+        lwd = 2,
+        col=c("#A58AFF","#53B400", "#00B6EB"),
+        fill = c(alpha("#A58AFF",1),alpha("#53B400",1), alpha("#00B6EB",1)),
+        scaled = T,
+        cex = 1.5,
+        fontface = "bold",
+        fontfamily = "sans",
+        # Set names
+        cat.cex = 0.8,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.fontfamily = "sans",
+        cat.col =  c("#A58AFF","#53B400", "#00B6EB")
+)
+
+ggsave(p1, file="Venn for media samples four cell lines overlap sig05 wo replicates.pdf", 
+       device = "pdf", width = 4, height = 4, units = "in", dpi = 300)
+
+```
+
+
+## Heatmap plotting for media samples metabolic profile
+
+```{r Heatmap plotting}
+
+df <- counts(dds, normalized = T) %>% as.data.frame()
+
+# get genes for glycolysis and OXPHOS
+glyco <- read.delim("/Users/tianyili/Downloads/HALLMARK_GLYCOLYSIS.v2023.2.Hs.tsv")
+glyco <- str_split(glyco[which(glyco$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+oxphos <- read.delim("/Users/tianyili/Downloads/HALLMARK_OXIDATIVE_PHOSPHORYLATION.v2023.2.Hs.tsv")
+oxphos <- str_split(oxphos[which(oxphos$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+energy <- c(glyco, oxphos)
+
+# Subset dataset
+df$geneid <- rownames(df) 
+df <- merge(df, output, by.x = "geneid", by.y = "ensembl_gene_id", all.x = T, all.y = F)
+df <- df[which(df$external_gene_name %in% energy),] %>% unique()
+rownames(df) <- df$external_gene_name
+
+# remove unused column
+df <- df[,-c(1, 18:20)]
+
+# Scale the dataset
+scaleSTAT <- scale(t(df), scale = T, center = T) %>% t() %>%
+               as.data.frame()
+
+scaleSTAT <- na.omit(scaleSTAT)
+
+# Calculate correlation between samples
+cor3 <- cor(scaleSTAT)
+res <- corrplot::cor.mtest(scaleSTAT, conf.level = 0.95)
+p <- res$p
+mycol <- colorRampPalette(c("#06a7cd", "white", "#e74a32"), alpha = T)
+corrplot::corrplot(cor3, type = "upper", outline = "grey",
+                   order = c("AOE"), col = mycol(100), diag = T, tl.col = "black",
+                   p.mat = p, sig.level = c(0.001, 0.01, 0.05),
+                   insig = "label_sig",
+                   pch.cex = 1.2,
+                   pch.col = "black")
+
+new_cols <- c("COV434", "KGN", "PA1", "Primary")
+# Get the average expression among three biological replicates
+scaleSTAT_avg <- sapply(c(5,10,13,16), function(j) {
+  if (j < 11) {
+    base::rowMeans(scaleSTAT[, j-5+(1:5)])
+  } else {
+      base::rowMeans(scaleSTAT[, j-2+(0:2)])
+    }
+  }) %>% 
+  as.data.frame() %>% 
+  set_names(new_cols)
+
+# Calculate correlation between samples
+cor4 <- cor(scaleSTAT_avg)
+res1 <- corrplot::cor.mtest(scaleSTAT_avg, conf.level = 0.95)
+p1 <- res1$p
+mycol <- colorRampPalette(c("#06a7cd", "white", "#e74a32"), alpha = T)
+corrplot::corrplot(cor4, type = "upper", outline = "grey",
+                   order = c("AOE"), col = mycol(100), diag = T, tl.col = "black",
+                   p.mat = p1, sig.level = c(0.001, 0.01, 0.05),
+                   insig = "label_sig",
+                   pch.cex = 1.2,
+                   pch.col = "black")
+
+# Annotate the row and split by glycolysis and OXPHOS markers
+anno <- as.data.frame(energy)
+anno$group <- ifelse(anno$energy %in% glyco, "Glycolysis", "OXPHOS")
+anno <- anno[which(anno$energy %in% rownames(scaleSTAT_avg)),] %>% unique()
+rownames(anno) <- anno$energy
+
+#labRow <- c("ENO1","LDHA","COX4I1","ATP5F1A")
+#subset <- match(labRow, rownames(scaleSTAT_avg))
+#labels <- rownames(scaleSTAT_avg)[c(subset)]
+#ra <- rowAnnotation(foo = anno_mark(at = c(1:4, 20, 60, 97:100)), width = unit(0.5, "cm") + max_text_width(labels))
+
+ComplexHeatmap::Heatmap(as.matrix(scaleSTAT_avg), name = "Z-score",
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        show_row_names = F,
+        row_split = anno$group,
+        cluster_row_slices = T,
+        #right_annotation = ra,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+```{r Session info}
+sessionInfo()
+```
+
+
+## Session info
+
+```{r}
+sessionInfo()
+```
+

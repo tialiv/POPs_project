@@ -1,0 +1,40 @@
+---
+title: "sessionInfo - POPs"
+output: html_document
+date: "2024-01-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Load dependencies}
+suppressMessages(library(dplyr))
+suppressMessages(library(som))
+suppressMessages(library(readr))
+suppressMessages(library(DESeq2))
+suppressMessages(library(ggplot2))
+suppressMessages(library(pheatmap))
+suppressMessages(library(umap))
+suppressMessages(library(biomaRt))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(DOSE))
+suppressMessages(library(pathview))
+suppressMessages(library(clusterProfiler))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(msigdbr))
+suppressMessages(library(edgeR))
+suppressMessages(library(tidyverse))
+suppressMessages(library(enrichplot))
+suppressMessages(library(openxlsx))
+suppressMessages(library(ggrepel))
+suppressMessages(library(matrixStats))
+
+```
+
+## Session info
+
+```{r info}
+sessionInfo()
+```
